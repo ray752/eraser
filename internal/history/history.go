@@ -138,6 +138,7 @@ func (s *Store) migrate() error {
 	// These must run before the index creation below
 	s.db.Exec(`ALTER TABLE removal_requests ADD COLUMN pipeline_status TEXT DEFAULT 'email_sent'`)
 	s.db.Exec(`ALTER TABLE pending_tasks ADD COLUMN opened_at DATETIME`)
+	s.db.Exec(`ALTER TABLE broker_responses ADD COLUMN email_body TEXT`)
 
 	query := `
 	CREATE TABLE IF NOT EXISTS removal_requests (
@@ -300,6 +301,28 @@ func (s *Store) GetMonthlyStats() (sent, failed int, err error) {
 		return 0, 0, fmt.Errorf("failed to get monthly stats: %w", err)
 	}
 	return int(sentNull.Int64), int(failedNull.Int64), nil
+}
+
+// SentBrokerIDs returns the set of broker IDs that have at least one
+// successfully sent removal request. Used to make `send` resumable: the June
+// 2026 run hit Gmail's daily SMTP cap after ~540 messages and recorded 480
+// failures, and a re-run without this would re-mail everyone who already got one.
+func (s *Store) SentBrokerIDs() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT broker_id FROM removal_requests WHERE status = 'sent'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }

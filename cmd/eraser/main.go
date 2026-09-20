@@ -27,6 +27,8 @@ var (
 	cfgFile    string
 	brokerFile string
 	dryRun     bool
+	sendLimit  int
+	resendSent bool
 )
 
 func resolveBrokerPath() string {
@@ -103,6 +105,8 @@ func sendCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview emails without sending")
+	cmd.Flags().IntVar(&sendLimit, "limit", 0, "Stop after this many brokers (0 = no limit). Gmail app passwords cap at ~500 messages/day")
+	cmd.Flags().BoolVar(&resendSent, "resend-sent", false, "Also mail brokers that already received a successful request")
 
 	return cmd
 }
@@ -288,6 +292,35 @@ func runSend() error {
 	}
 	defer store.Close()
 
+	// Skip brokers that already received a request, so a run interrupted by
+	// Gmail's daily send cap can be resumed the next day without re-mailing
+	// everyone. Pass --resend-sent to override.
+	if !resendSent {
+		sentIDs, err := store.SentBrokerIDs()
+		if err != nil {
+			return fmt.Errorf("failed to read send history: %w", err)
+		}
+		remaining := brokers[:0]
+		for _, b := range brokers {
+			if !sentIDs[b.ID] {
+				remaining = append(remaining, b)
+			}
+		}
+		if skipped := len(brokers) - len(remaining); skipped > 0 {
+			fmt.Printf("⏭️  Skipping %d brokers already sent (use --resend-sent to include them)\n", skipped)
+		}
+		brokers = remaining
+		if len(brokers) == 0 {
+			fmt.Println("Nothing left to send.")
+			return nil
+		}
+	}
+
+	if sendLimit > 0 && len(brokers) > sendLimit {
+		fmt.Printf("🔢 Limiting this run to %d of %d remaining brokers\n", sendLimit, len(brokers))
+		brokers = brokers[:sendLimit]
+	}
+
 	// Process brokers
 	if cfg.Options.DryRun {
 		fmt.Println("🔍 DRY RUN MODE - No emails will be sent")
@@ -299,6 +332,10 @@ func runSend() error {
 
 	successCount := 0
 	failCount := 0
+	// Gmail stops accepting once the daily cap is hit, and every subsequent
+	// message fails identically. Stop rather than record hundreds of failures.
+	consecutiveFails := 0
+	const maxConsecutiveFails = 10
 
 	for i, b := range brokers {
 		fmt.Printf("[%d/%d] %s (%s)\n", i+1, len(brokers), b.Name, b.Email)
@@ -341,15 +378,22 @@ func runSend() error {
 				record.MessageID = result.MessageID
 				fmt.Printf("  ✅ Sent successfully\n")
 				successCount++
+				consecutiveFails = 0
 			} else {
 				record.Status = history.StatusFailed
 				record.Error = result.Error.Error()
 				fmt.Printf("  ❌ Failed: %v\n", result.Error)
 				failCount++
+				consecutiveFails++
 			}
 
 			if err := store.Add(record); err != nil {
 				fmt.Printf("  ⚠️  Failed to record history: %v\n", err)
+			}
+
+			if consecutiveFails >= maxConsecutiveFails {
+				fmt.Printf("\n🛑 Stopping: %d sends failed in a row. This is what a hit send quota looks like — wait 24h and run again.\n", consecutiveFails)
+				break
 			}
 
 			// Rate limiting

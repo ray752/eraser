@@ -37,6 +37,33 @@ type Email struct {
 	BrokerName  string // Matched broker name (if found)
 }
 
+// freeMailDomains are consumer mailbox providers. A handful of brokers in
+// data/brokers.yaml register a contact address on one of these, which would
+// otherwise turn the whole provider into a "broker domain" and sweep every
+// personal email from it into the archive folder.
+var freeMailDomains = map[string]bool{
+	"gmail.com":       true,
+	"googlemail.com":  true,
+	"yahoo.com":       true,
+	"yahoo.co.uk":     true,
+	"hotmail.com":     true,
+	"outlook.com":     true,
+	"live.com":        true,
+	"msn.com":         true,
+	"aol.com":         true,
+	"icloud.com":      true,
+	"me.com":          true,
+	"mac.com":         true,
+	"proton.me":       true,
+	"protonmail.com":  true,
+	"gmx.com":         true,
+	"gmx.net":         true,
+	"mail.com":        true,
+	"yandex.ru":       true,
+	"inbox.lv":        true,
+	"one.lv":          true,
+}
+
 // NewMonitor creates a new inbox monitor
 func NewMonitor(cfg config.InboxConfig, brokerList []broker.Broker) *Monitor {
 	// Build a map of email domains to brokers for quick lookup
@@ -47,13 +74,15 @@ func NewMonitor(cfg config.InboxConfig, brokerList []broker.Broker) *Monitor {
 			parts := strings.Split(b.Email, "@")
 			if len(parts) == 2 {
 				domain := strings.ToLower(parts[1])
-				brokerMap[domain] = b
+				if !freeMailDomains[domain] {
+					brokerMap[domain] = b
+				}
 			}
 		}
 		// Also map by website domain
 		if b.Website != "" {
 			domain := extractDomain(b.Website)
-			if domain != "" {
+			if domain != "" && !freeMailDomains[domain] {
 				brokerMap[domain] = b
 			}
 		}
@@ -136,40 +165,87 @@ func (m *Monitor) FetchRecentEmails(ctx context.Context, days int) ([]Email, err
 		return nil, fmt.Errorf("failed to search emails: %w", err)
 	}
 
-	log.Printf("Found %d emails since %s", len(uids), since.Format("2006-01-02"))
-
 	if len(uids) == 0 {
 		return nil, nil
 	}
 
-	// Fetch the messages using UIDs
-	seqSet := new(imap.SeqSet)
-	seqSet.AddNum(uids...)
+	log.Printf("Found %d emails since %s, fetching envelopes first", len(uids), since.Format("2006-01-02"))
 
-	// Fetch envelope, body, and UID
-	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchUid, section.FetchItem()}
+	// Phase 1: fetch envelopes only (no body) to identify broker emails without timing out
+	const batchSize = 50
+	var brokerUIDs []uint32
 
-	messages := make(chan *imap.Message, len(uids))
-	done := make(chan error, 1)
-	go func() {
-		done <- m.client.UidFetch(seqSet, items, messages)
-	}()
-
-	var emails []Email
-	for msg := range messages {
-		email, err := m.parseMessage(msg, section)
-		if err != nil {
-			log.Printf("Warning: failed to parse message: %v", err)
-			continue
+	for i := 0; i < len(uids); i += batchSize {
+		end := i + batchSize
+		if end > len(uids) {
+			end = len(uids)
 		}
-		if email != nil {
-			emails = append(emails, *email)
+		batch := uids[i:end]
+
+		seqSet := new(imap.SeqSet)
+		seqSet.AddNum(batch...)
+
+		messages := make(chan *imap.Message, len(batch))
+		done := make(chan error, 1)
+		go func() {
+			done <- m.client.UidFetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, messages)
+		}()
+
+		for msg := range messages {
+			if msg == nil || msg.Envelope == nil {
+				continue
+			}
+			if len(msg.Envelope.From) > 0 {
+				domain := strings.ToLower(msg.Envelope.From[0].HostName)
+				if _, ok := m.brokers[domain]; ok {
+					brokerUIDs = append(brokerUIDs, msg.Uid)
+				}
+			}
+		}
+		if err := <-done; err != nil {
+			log.Printf("Warning: envelope batch fetch error: %v", err)
 		}
 	}
 
-	if err := <-done; err != nil {
-		return nil, fmt.Errorf("failed to fetch messages: %w", err)
+	log.Printf("Found %d broker emails out of %d total, fetching bodies", len(brokerUIDs), len(uids))
+
+	if len(brokerUIDs) == 0 {
+		return nil, nil
+	}
+
+	// Phase 2: fetch full body only for matched broker emails
+	var emails []Email
+	section := &imap.BodySectionName{}
+
+	for i := 0; i < len(brokerUIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(brokerUIDs) {
+			end = len(brokerUIDs)
+		}
+		batch := brokerUIDs[i:end]
+
+		seqSet := new(imap.SeqSet)
+		seqSet.AddNum(batch...)
+
+		messages := make(chan *imap.Message, len(batch))
+		done := make(chan error, 1)
+		go func() {
+			done <- m.client.UidFetch(seqSet, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchUid, section.FetchItem()}, messages)
+		}()
+
+		for msg := range messages {
+			email, err := m.parseMessage(msg, section)
+			if err != nil {
+				log.Printf("Warning: failed to parse message: %v", err)
+				continue
+			}
+			if email != nil {
+				emails = append(emails, *email)
+			}
+		}
+		if err := <-done; err != nil {
+			log.Printf("Warning: body batch fetch error: %v", err)
+		}
 	}
 
 	return emails, nil
